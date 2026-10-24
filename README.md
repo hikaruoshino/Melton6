@@ -156,3 +156,9 @@ Melton6 は**装備の着替えを行いません**。アビリティと魔法�
   * 初版リリース。震天 6 連携 → 大悟徹底・気炎万丈の章 → メルトン MB をマクロ 1 回で実行。
   * アクションパケットで実行・着弾・連携・MB を確かめて進み、失敗したら止まる。
   * 大悟徹底・気炎万丈の章は、どちらか一方が実行されればメルトンまで続行。
+
+## 不具合・動作報告 / Feedback
+
+「動きました」の一言だけでも歓迎です。GitHub のアカウントがあれば、[Issues](../../issues/new/choose) から書き込めます (日本語・英語どちらでも)。
+
+A one-line "it works" is welcome too. With a GitHub account you can post from [Issues](../../issues/new/choose) (Japanese or English).
