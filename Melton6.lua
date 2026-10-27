@@ -28,7 +28,7 @@
 
 _addon.name     = "Melton6"
 _addon.author   = "hikaruoshino"
-_addon.version  = "1.0.0"
+_addon.version  = "1.0.1"
 _addon.commands = {"m6", "melton6"}
 
 local config = require("config")
@@ -49,6 +49,22 @@ local defaults = {
     use_tabula_rasa        = true,  -- 連環計が切れていたら自動で使う (false なら止める)
 }
 local settings = config.load(defaults)
+
+-- 設定の値の範囲 (最小, 最大)。範囲外 (0 や負の数、極端に大きい値) だと、入力が連打されたり、いつまでも止まらなかったりするため
+-- settings.xml を手で書き換えた場合も、読み込み時にこの範囲に収める
+local LIMITS = {
+    post_land_sec = {0, 10}, ja_gap_sec = {0.5, 5}, ja_timeout_sec = {0.5, 10}, boost_timeout_sec = {0.5, 5},
+    ja_retries = {0, 2}, cast_start_timeout_sec = {1, 10}, land_timeout_sec = {3, 30}, mb_window_sec = {5, 15},
+}
+local function clamp_setting(key, value)
+    local lim = LIMITS[key]
+    local n = tonumber(value)
+    if not lim or not n then return defaults[key] end
+    if n < lim[1] then n = lim[1] elseif n > lim[2] then n = lim[2] end
+    if key == "ja_retries" then n = math.floor(n) end
+    return n
+end
+for key in pairs(LIMITS) do settings[key] = clamp_setting(key, settings[key]) end
 
 -- -----------------------------------------------------------------------------
 -- 定数 (番号は Windower の res の値)
@@ -153,7 +169,7 @@ local function precheck()
 
     -- 計略魔法とメルトンの再詠唱 (途中で使えずに止まると、連環計が無駄になるため先に確かめる)
     local spell_recasts = windower.ffxi.get_spell_recasts() or {}
-    for _, id in ipairs({SPELL.GEOHELIX, SPELL.ANEMOHELIX, SPELL.NOCTOHELIX, SPELL.KAUSTRA}) do
+    for _, id in ipairs({SPELL.AERO, SPELL.STONE, SPELL.GEOHELIX, SPELL.ANEMOHELIX, SPELL.NOCTOHELIX, SPELL.KAUSTRA}) do
         local r = (spell_recasts[id] or 0) / 60
         if r > 0 then table.insert(problems, string.format("%s の再詠唱まで %.0f秒", spell_name(id), r)) end
     end
@@ -356,10 +372,10 @@ local function on_action(act)
             -- 闇門の計 (重力) の着弾からメルトン着弾までの秒数
             local since_sc = run.sc_landed_at and string.format("%.2f秒", now - run.sc_landed_at) or "?"
             if is_magic_burst(act) then
-                finish(string.format("メルトンでマジックバースト成功！ (%d連携 / %s / 重力から %s)", run.chain_count, boosts, since_sc))
+                finish(string.format("メルトンでマジックバースト成功！ (%d連携 / %s / 重力から %s / %s)", run.chain_count, boosts, since_sc, run.target_name))
             else
                 finish((late and "メルトンが MB 受付に間に合いませんでした (MB なし)" or "メルトンは着弾しましたが MB になりませんでした")
-                    .. string.format(" (%s / 重力から %s / メッセージ %s)", boosts, since_sc, messages_of(act)))
+                    .. string.format(" (%s / 重力から %s / メッセージ %s / %s)", boosts, since_sc, messages_of(act), run.target_name))
             end
             return
         end
@@ -410,6 +426,7 @@ local function start()
         phase = "wait",
         next_at = os.clock(),
         target_id = target.id,
+        target_name = target.name or "?",   -- 結果の表示に出す (どの敵で MB になったか・ならなかったかを後で確かめられるように)
         chain_count = 0,
         tries = 0,
         boosted = {},   -- [大悟徹底 / 気炎万丈の章の番号] = 実行された
@@ -457,8 +474,12 @@ windower.register_event("addon command", function(cmd, ...)
 
     elseif cmd == "set" and SETTABLE[(args[1] or ""):lower()] and tonumber(args[2]) then
         local key = SETTABLE[args[1]:lower()]
-        settings[key] = tonumber(args[2])
+        local want = tonumber(args[2])
+        settings[key] = clamp_setting(key, want)
         config.save(settings)
+        if settings[key] ~= want then
+            chat(string.format("%s は範囲 %s〜%s に収めました", key, tostring(LIMITS[key][1]), tostring(LIMITS[key][2])), 167)
+        end
         chat(string.format("%s = %s", key, tostring(settings[key])))
 
     elseif cmd == "status" then
