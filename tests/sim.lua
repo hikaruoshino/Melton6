@@ -105,26 +105,46 @@ end
 
 local function ok_behave(kind, id, n) return {} end
 
--- S1 正常: 17 回送る / MB 成功
+-- S1 正常: 16 回送る / MB 成功 (1.0.2 で大悟徹底を外した)
 do
     local W = run_world({behave = function(k, id) if k == 'ma' and id == 502 then return {mb = true, cast = 2} end return {} end})
     W.go(); W.run_until(90)
     if os.getenv('DBG') then for _, c in ipairs(W.chat) do print('  chat:', c) end for _, s2 in ipairs(W.sent) do print(string.format('  %.2f %s', s2.t, s2.cmd)) end end
-    check(#W.sent == 17, "S1 正常: 入力は 17 回 (実際 " .. #W.sent .. ")")
+    check(#W.sent == 16, "S1 正常: 入力は 16 回 (実際 " .. #W.sent .. ")")
     check(W.log_has('マジックバースト成功'), "S1 メルトンで MB 成功を表示する")
     local names = W.names()
-    local want = {'連環計', '黒のグリモア', '震天動地の章', 'エアロ', '震天動地の章', 'ストーン', '震天動地の章', 'エアロ', '震天動地の章', '土門の計', '震天動地の章', '風門の計', '震天動地の章', '闇門の計', '大悟徹底', '気炎万丈の章', 'メルトン'}
+    local want = {'連環計', '黒のグリモア', '震天動地の章', 'エアロ', '震天動地の章', 'ストーン', '震天動地の章', 'エアロ', '震天動地の章', '土門の計', '震天動地の章', '風門の計', '震天動地の章', '闇門の計', '気炎万丈の章', 'メルトン'}
     for i, w in ipairs(want) do check(names[i] == w, "S1 順序 " .. i .. ": 期待 " .. w .. " / 実際 " .. tostring(names[i])) end
     local before = #W.sent
     W.run_until(120)
     check(#W.sent == before, "S1 完了後は何も送らない")
 end
 
--- S2 連環計・黒のグリモアが効果中なら飛ばす: 15 回
+-- S12 最後の重力のあとは post_final_sec (3.0・魔法のあとの硬直) 待って気炎万丈の章: メルトンは受付 7 秒より前に着弾 (1.0.2)
+do
+    -- 実機に近い遅れ: アビの実行 0.6 秒・メルトンの詠唱 0.8 秒
+    local W = run_world({buffs = {377, 359}, behave = function(k, id)
+        if k == 'ja' then return {delay = 0.6} end
+        if id == 502 then return {mb = true, cast = 0.8} end
+        return {}
+    end})
+    W.go(); W.run_until(90)
+    local t = {}
+    for _, s2 in ipairs(W.sent) do local n = s2.cmd:match('"([^"]+)"'); t[n] = t[n] or {}; table.insert(t[n], s2.t) end
+    local sc_land = t['闇門の計'][1] + 0.3 + 1.5     -- 闇門の計: 送信 → 詠唱開始 0.3 → 着弾 1.5 (sim の既定)
+    local melton_land = t['メルトン'][1] + 0.3 + 0.8
+    check(t['気炎万丈の章'][1] - sc_land >= 3.0, string.format("S12 重力の着弾から気炎万丈の章まで 3.0 秒以上 (実際 %.2f)", t['気炎万丈の章'][1] - sc_land))
+    check(melton_land - sc_land < 7.0, string.format("S12 メルトンは重力から 7 秒以内に着弾 (実際 %.2f)", melton_land - sc_land))
+    check(t['大悟徹底'] == nil, "S12 大悟徹底は使わない")
+    check(W.log_has('受付 7.0秒'), "S12 結果に MB 受付 7.0 秒を出す")
+    if os.getenv('DBG') then print(string.format('  S12 重力→メルトン着弾 %.2f 秒', melton_land - sc_land)) end
+end
+
+-- S2 連環計・黒のグリモアが効果中なら飛ばす: 14 回
 do
     local W = run_world({buffs = {377, 359}, behave = function(k, id) if k == 'ma' and id == 502 then return {mb = true} end return {} end})
     W.go(); W.run_until(90)
-    check(#W.sent == 15, "S2 効果中は飛ばす: 15 回 (実際 " .. #W.sent .. ")")
+    check(#W.sent == 14, "S2 効果中は飛ばす: 14 回 (実際 " .. #W.sent .. ")")
 end
 
 -- S3 詠唱が中断されたら止まる
@@ -152,17 +172,14 @@ do
     check(W.log_has('アビリティが実行されませんでした'), "S5 理由を表示する")
 end
 
--- S6 大悟・気炎: 片方だけ不発なら続行 / 両方不発ならメルトンの前で止まる
+-- S6 気炎万丈の章が実行されなければ、使い直さずにメルトンの前で止まる
 do
-    local W = run_world({buffs = {377, 359}, behave = function(k, id) if k == 'ja' and id == 244 then return nil end if k == 'ma' and id == 502 then return {mb = true} end return {} end})
+    local W = run_world({buffs = {377, 359}, behave = function(k, id) if k == 'ja' and id == 221 then return nil end return {} end})
     W.go(); W.run_until(90)
-    check(W.log_has('マジックバースト成功'), "S6 片方だけ不発でもメルトンまで続く")
-    local W2 = run_world({buffs = {377, 359}, behave = function(k, id) if k == 'ja' and (id == 244 or id == 221) then return nil end return {} end})
-    W2.go(); W2.run_until(90)
-    local names = W2.names()
-    local kaustra = false
-    for _, n in ipairs(names) do if n == 'メルトン' then kaustra = true end end
-    check(not kaustra and W2.log_has('どちらも実行されませんでした'), "S6 両方不発ならメルトンを撃たずに止まる")
+    local n_ebu, kaustra = 0, false
+    for _, n in ipairs(W.names()) do if n == 'メルトン' then kaustra = true end if n == '気炎万丈の章' then n_ebu = n_ebu + 1 end end
+    check(not kaustra and W.log_has('気炎万丈の章 が実行されませんでした'), "S6 気炎が不発ならメルトンを撃たずに止まる")
+    check(n_ebu == 1, "S6 気炎万丈の章は使い直さない (実際 " .. n_ebu .. " 回)")
 end
 
 -- S7 ターゲットが変わったら止まる / エリア移動・ログアウト・戦闘不能で止まる

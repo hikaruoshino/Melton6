@@ -7,18 +7,22 @@
 --   連環計 → 黒のグリモア
 --   → 震天 エアロ(炸裂) → 震天 ストーン(切断)=切断 → 震天 エアロ=炸裂
 --   → 震天 土門の計=切断 → 震天 風門の計=炸裂 → 震天 闇門の計(収縮)=重力
---   → 大悟徹底 → 気炎万丈の章 → メルトン (重力に闇で MB)
+--   → 気炎万丈の章 → メルトン (重力に闇で MB)
 --
 -- 【進め方】 固定の待ち時間ではなく、アクションパケットで実行を確かめてから次へ進む。
 --   アビリティ : 実行のパケット (category 6) を確かめてから ja_gap_sec (1 秒) 待って次へ。
---                大悟徹底 → 気炎万丈の章は 1 秒空けないと不発になる (ユーザー確認済み)
---                大悟徹底・気炎万丈の章は、回線のラグで不発になることがあるため、どちらか一方でも
---                実行されればメルトンまで続ける (両方とも不発ならメルトンの前で止める)。使い直しはしない
+--                気炎万丈の章は MB 受付に間に合わせるため使い直さない。実行されなければメルトンの前で止める
 --   魔法       : 詠唱開始 (category 8) と着弾 (category 4) を確かめる。2 段目以降は狙った連携が
 --                起きたか (追加効果メッセージ) も確かめ、着弾から post_land_sec 待って次へ。
+--                最後の重力のあとは post_final_sec (3 秒) 待って気炎万丈の章へ。魔法の着弾のあと約 2.5〜3.5 秒は
+--                硬直でアビリティを使えない (0.5 秒では「アビリティは使えなかった」で弾かれた)。
+--   MB 受付   : 連携の窓は 1 段ごとに 1 秒縮み (10 - 段数)、計略魔法で〆ると +2 秒。
+--                6 連 (連携 5 回目の重力) は 10 - 5 + 2 = 7 秒。1.0.1 までは大悟徹底 → 気炎万丈の章 → メルトンで
+--                着弾が重力から 7.2〜7.5 秒になり MB を逃していた。大悟徹底を外し、約 5.7 秒で着弾させる
+--                (2026-10-29 のゲーム内のログ・ユーザー判断)。
 --   失敗 (詠唱中断・連携が起きない・時間切れ・ターゲットが変わった・エリア移動など) したら、その場で止める。
 --
--- 【注意: 自動キャストアドオン】 マクロ 1 回の操作で、アビリティと魔法の入力 (最大 17 回) を自動で送る。
+-- 【注意: 自動キャストアドオン】 マクロ 1 回の操作で、アビリティと魔法の入力 (最大 16 回) を自動で送る。
 --   1 回押せば 1 回だけ実行し、繰り返しはしない。失敗したらその場で止まる。
 --   外部ツールの利用は FFXI の利用規約で認められていないため、使用は自己責任で。
 --   放置・無人での使用や、改変して自動戦闘・連打に使うことはしないこと。
@@ -28,7 +32,7 @@
 
 _addon.name     = "Melton6"
 _addon.author   = "hikaruoshino"
-_addon.version  = "1.0.1"
+_addon.version  = "1.0.2"
 _addon.commands = {"m6", "melton6"}
 
 local config = require("config")
@@ -39,13 +43,13 @@ local res    = require("resources")
 -- -----------------------------------------------------------------------------
 local defaults = {
     post_land_sec          = 3.0,   -- 魔法の着弾から、次のアビリティを使うまでの秒数
+    post_final_sec         = 3.0,   -- 最後の重力の着弾から、気炎万丈の章を使うまでの秒数 (魔法のあとの硬直が解けるまで)
     ja_gap_sec             = 1.0,   -- アビリティの実行から、次の行動までの秒数 (<wait 1> 相当)
     ja_timeout_sec         = 2.5,   -- アビリティを使ってから、実行を確認できるまで待つ秒数
-    boost_timeout_sec      = 1.5,   -- 大悟徹底・気炎万丈の章だけの待ち秒数 (MB 受付に間に合わせるため短く)
+    boost_timeout_sec      = 1.5,   -- 気炎万丈の章だけの待ち秒数 (MB 受付に間に合わせるため短く)
     ja_retries             = 1,     -- アビリティが実行されなかったときに、もう一度使う回数
     cast_start_timeout_sec = 2.5,   -- 魔法を使ってから、詠唱開始を確認できるまで待つ秒数
     land_timeout_sec       = 12.0,  -- 詠唱開始から、着弾を確認できるまで待つ秒数
-    mb_window_sec          = 10.0,  -- 闇門の計の着弾から MB を受け付ける秒数 (計略魔法〆は 8 + 2 秒)
     use_tabula_rasa        = true,  -- 連環計が切れていたら自動で使う (false なら止める)
 }
 local settings = config.load(defaults)
@@ -53,9 +57,16 @@ local settings = config.load(defaults)
 -- 設定の値の範囲 (最小, 最大)。範囲外 (0 や負の数、極端に大きい値) だと、入力が連打されたり、いつまでも止まらなかったりするため
 -- settings.xml を手で書き換えた場合も、読み込み時にこの範囲に収める
 local LIMITS = {
-    post_land_sec = {0, 10}, ja_gap_sec = {0.5, 5}, ja_timeout_sec = {0.5, 10}, boost_timeout_sec = {0.5, 5},
-    ja_retries = {0, 2}, cast_start_timeout_sec = {1, 10}, land_timeout_sec = {3, 30}, mb_window_sec = {5, 15},
+    post_land_sec = {0, 10}, post_final_sec = {0, 5}, ja_gap_sec = {0.5, 5}, ja_timeout_sec = {0.5, 10}, boost_timeout_sec = {0.5, 5},
+    ja_retries = {0, 2}, cast_start_timeout_sec = {1, 10}, land_timeout_sec = {3, 30},
 }
+
+-- MB 受付の秒数: 連携の窓 (10 - 段数・最短 4 秒。OmniChain・ChainGuide と同じ値) + 計略魔法で〆た分の 2 秒
+-- chain_count は「何連目の魔法か」(6 連なら 6)。連携の段数はその 1 つ少ない数 (6 連目の重力は 5 回目の連携)
+local SC_WINDOW_BASE_SEC, SC_WINDOW_MIN_SEC, IMMANENCE_BONUS_SEC = 10.0, 4.0, 2.0
+local function mb_window_sec(chain_count)
+    return math.max(SC_WINDOW_MIN_SEC, SC_WINDOW_BASE_SEC - (chain_count - 1)) + IMMANENCE_BONUS_SEC
+end
 local function clamp_setting(key, value)
     local lim = LIMITS[key]
     local n = tonumber(value)
@@ -69,10 +80,10 @@ for key in pairs(LIMITS) do settings[key] = clamp_setting(key, settings[key]) en
 -- -----------------------------------------------------------------------------
 -- 定数 (番号は Windower の res の値)
 -- -----------------------------------------------------------------------------
-local JA = {TABULA_RASA = 210, DARK_ARTS = 212, EBULLIENCE = 221, ENLIGHTENMENT = 244, IMMANENCE = 317}
+local JA = {TABULA_RASA = 210, DARK_ARTS = 212, EBULLIENCE = 221, IMMANENCE = 317}
 local SPELL = {AERO = 154, STONE = 159, GEOHELIX = 278, ANEMOHELIX = 280, NOCTOHELIX = 284, KAUSTRA = 502}
 local BUFF = {DARK_ARTS = 359, ADDENDUM_BLACK = 402, TABULA_RASA = 377}
-local RECAST = {TABULA_RASA = 0, ENLIGHTENMENT = 235}   -- アビリティのリキャスト番号
+local RECAST = {TABULA_RASA = 0}   -- アビリティのリキャスト番号
 
 local CAST_BEGIN, CAST_INTERRUPT = 24931, 28787         -- category 8 の param
 -- 「Magic Burst!」のメッセージ番号 (res/action_messages.lua で "Magic Burst" を含むもの全部)。
@@ -137,9 +148,7 @@ local function build_steps()
         table.insert(steps, {kind = "ja", id = JA.IMMANENCE, target = "<me>"})
         table.insert(steps, {kind = "ma", id = c[1], target = "<t>", expect_sc = c[2], chain_no = i})
     end
-    -- 大悟徹底・気炎万丈の章は威力上げ。回線のラグで不発になることがあるので、どちらか一方でも
-    -- 実行されればメルトンまで続ける (boost)。MB 受付に間に合わせるため、使い直しはしない
-    table.insert(steps, {kind = "ja", id = JA.ENLIGHTENMENT, target = "<me>", boost = true})
+    -- 気炎万丈の章は威力上げ (boost)。MB 受付に間に合わせるため、使い直しはしない
     table.insert(steps, {kind = "ja", id = JA.EBULLIENCE, target = "<me>", boost = true})
     table.insert(steps, {kind = "ma", id = SPELL.KAUSTRA, target = "<t>", final = true})
     return steps
@@ -174,9 +183,6 @@ local function precheck()
         if r > 0 then table.insert(problems, string.format("%s の再詠唱まで %.0f秒", spell_name(id), r)) end
     end
     local ja_recasts = windower.ffxi.get_ability_recasts() or {}
-    if (ja_recasts[RECAST.ENLIGHTENMENT] or 0) > 0 then
-        table.insert(problems, string.format("大悟徹底の再使用まで %d秒", ja_recasts[RECAST.ENLIGHTENMENT]))
-    end
     if not has_buff(player, BUFF.TABULA_RASA) then
         if not settings.use_tabula_rasa then
             table.insert(problems, "連環計の効果中ではありません (メルトンは連環計の効果中のみ詠唱できます)")
@@ -233,8 +239,8 @@ local function send_step(now)
         return
     end
 
-    if step.final and not (run.boosted[JA.ENLIGHTENMENT] or run.boosted[JA.EBULLIENCE]) then
-        stop("大悟徹底・気炎万丈の章がどちらも実行されませんでした")
+    if step.final and not run.boosted[JA.EBULLIENCE] then
+        stop("気炎万丈の章が実行されませんでした")
         return
     end
 
@@ -251,8 +257,7 @@ local function send_step(now)
     else
         send_input(string.format('/ja "%s" %s', ja_name(step.id), step.target))
         run.phase = "ja_sent"
-        -- 大悟徹底・気炎万丈の章は待ちを短く: 両方とも不発が重なっても、重力の着弾から 10 秒以内に
-        -- メルトンを着弾させるため (2.5 秒だと約 10.7 秒かかり MB 受付を過ぎる)
+        -- 気炎万丈の章は待ちを短く: 不発ならすぐに止める (使い直す時間は MB 受付に残っていない)
         run.deadline = now + (step.boost and settings.boost_timeout_sec or settings.ja_timeout_sec)
         run.tries = (run.tries or 0) + 1
     end
@@ -270,14 +275,8 @@ local function tick(now)
         if run.phase == "ja_sent" then
             local step = run.steps[run.index]
             if step.boost then
-                -- 威力上げのアビリティは、不発でも止めずに次へ (どちらも不発ならメルトンの前で止める)
-                chat(ja_name(step.id) .. " が実行されませんでした (続行します)", 167)
-                run.tries = 0
-                -- 次も威力上げ (大悟 → 気炎) なら待たずに使う: MB 受付に余裕を残すため。
-                -- 大悟がラグで遅れて実行されて気炎が不発になっても、大悟が数えられるので続行できる。
-                -- 次がメルトンなら 1 秒待つ (遅れて実行された気炎とぶつかって詠唱が弾かれないように)
-                local next_step = run.steps[run.index + 1]
-                advance(now, (next_step and next_step.boost) and 0 or settings.ja_gap_sec)
+                -- 気炎万丈の章は使い直さない (MB 受付に間に合わないため)。メルトンの前で止める
+                stop(ja_name(step.id) .. " が実行されませんでした")
             elseif run.tries <= settings.ja_retries then
                 send_step(now)   -- 不発 (待ち時間不足など) のときは、もう一度だけ使う
             else
@@ -340,8 +339,8 @@ local function on_action(act)
     if not step then return end
 
     if act.category == 6 then
-        -- 大悟徹底・気炎万丈の章は、ラグで遅れて届いても実行されたものとして数える
-        if act.param == JA.ENLIGHTENMENT or act.param == JA.EBULLIENCE then
+        -- 気炎万丈の章は、ラグで遅れて届いても実行されたものとして数える
+        if act.param == JA.EBULLIENCE then
             run.boosted[act.param] = true
         end
         -- アビリティの実行
@@ -366,16 +365,16 @@ local function on_action(act)
         if step.final then
             local late = run.mb_deadline and now > run.mb_deadline
             local used = {}
-            if run.boosted[JA.ENLIGHTENMENT] then table.insert(used, "大悟") end
             if run.boosted[JA.EBULLIENCE] then table.insert(used, "気炎") end
             local boosts = table.concat(used, "・")
             -- 闇門の計 (重力) の着弾からメルトン着弾までの秒数
             local since_sc = run.sc_landed_at and string.format("%.2f秒", now - run.sc_landed_at) or "?"
+            local window = string.format("受付 %.1f秒", mb_window_sec(run.chain_count))
             if is_magic_burst(act) then
-                finish(string.format("メルトンでマジックバースト成功！ (%d連携 / %s / 重力から %s / %s)", run.chain_count, boosts, since_sc, run.target_name))
+                finish(string.format("メルトンでマジックバースト成功！ (%d連携 / %s / 重力から %s / %s / %s)", run.chain_count, boosts, since_sc, window, run.target_name))
             else
                 finish((late and "メルトンが MB 受付に間に合いませんでした (MB なし)" or "メルトンは着弾しましたが MB になりませんでした")
-                    .. string.format(" (%s / 重力から %s / メッセージ %s / %s)", boosts, since_sc, messages_of(act), run.target_name))
+                    .. string.format(" (%s / 重力から %s / %s / メッセージ %s / %s)", boosts, since_sc, window, messages_of(act), run.target_name))
             end
             return
         end
@@ -388,8 +387,11 @@ local function on_action(act)
             run.chain_count = step.chain_no
             chat(string.format("%d連目: %s", step.chain_no, sc))
             if sc == "重力" then
+                -- 最後の連携: 硬直が解けるまで post_final_sec 待って気炎万丈の章へ
                 run.sc_landed_at = now
-                run.mb_deadline = now + settings.mb_window_sec
+                run.mb_deadline = now + mb_window_sec(run.chain_count)
+                advance(now, settings.post_final_sec)
+                return
             end
         end
         advance(now, settings.post_land_sec)
@@ -429,7 +431,7 @@ local function start()
         target_name = target.name or "?",   -- 結果の表示に出す (どの敵で MB になったか・ならなかったかを後で確かめられるように)
         chain_count = 0,
         tries = 0,
-        boosted = {},   -- [大悟徹底 / 気炎万丈の章の番号] = 実行された
+        boosted = {},   -- [気炎万丈の章の番号] = 実行された
     }
     chat("開始します → " .. (target.name or "?"))
 end
@@ -445,7 +447,7 @@ windower.register_event("unload", function() run = nil end)
 -- コマンド (//m6 または //melton6)
 -- -----------------------------------------------------------------------------
 local SETTABLE = {
-    post = "post_land_sec", gap = "ja_gap_sec", jatimeout = "ja_timeout_sec", boosttimeout = "boost_timeout_sec",
+    post = "post_land_sec", postfinal = "post_final_sec", gap = "ja_gap_sec", jatimeout = "ja_timeout_sec", boosttimeout = "boost_timeout_sec",
     retries = "ja_retries", casttimeout = "cast_start_timeout_sec", landtimeout = "land_timeout_sec",
 }
 
@@ -483,8 +485,8 @@ windower.register_event("addon command", function(cmd, ...)
         chat(string.format("%s = %s", key, tostring(settings[key])))
 
     elseif cmd == "status" then
-        chat(string.format("着弾→次 %.1f秒 / アビ後 %.1f秒 / アビ確認 %.1f秒×再試行%d (大悟・気炎 %.1f秒) / 詠唱開始確認 %.1f秒 / 着弾確認 %.1f秒 / 連環計自動 %s",
-            settings.post_land_sec, settings.ja_gap_sec, settings.ja_timeout_sec, settings.ja_retries, settings.boost_timeout_sec,
+        chat(string.format("着弾→次 %.1f秒 (重力のあと %.1f秒) / アビ後 %.1f秒 / アビ確認 %.1f秒×再試行%d (気炎 %.1f秒) / 詠唱開始確認 %.1f秒 / 着弾確認 %.1f秒 / 連環計自動 %s",
+            settings.post_land_sec, settings.post_final_sec, settings.ja_gap_sec, settings.ja_timeout_sec, settings.ja_retries, settings.boost_timeout_sec,
             settings.cast_start_timeout_sec, settings.land_timeout_sec, settings.use_tabula_rasa and "ON" or "OFF"))
         if run then chat(string.format("実行中: %d/%d", run.index, #run.steps)) end
 
@@ -494,7 +496,8 @@ windower.register_event("addon command", function(cmd, ...)
         chat("//m6 check   : 開始できるか確認だけする (何も実行しない)")
         chat("//m6 status  : 設定の表示")
         chat("//m6 set post <秒> : 魔法の着弾から次のアビリティまで (初期 3.0)")
-        chat("//m6 set gap <秒>  : アビリティの後の待ち (初期 1.0。大悟→気炎は 1 秒必要)")
+        chat("//m6 set postfinal <秒> : 最後の重力の着弾から気炎万丈の章まで (初期 3.0。硬直のため短くしすぎない)")
+        chat("//m6 set gap <秒>  : アビリティの後の待ち (初期 1.0)")
         chat("//m6 tabula  : 連環計が切れていたら自動で使うか (ON/OFF)")
     end
 end)
