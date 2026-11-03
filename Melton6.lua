@@ -32,7 +32,7 @@
 
 _addon.name     = "Melton6"
 _addon.author   = "hikaruoshino"
-_addon.version  = "1.0.2"
+_addon.version  = "1.1.0"
 _addon.commands = {"m6", "melton6"}
 
 local config = require("config")
@@ -46,10 +46,12 @@ local defaults = {
     post_final_sec         = 3.0,   -- 最後の重力の着弾から、気炎万丈の章を使うまでの秒数 (魔法のあとの硬直が解けるまで)
     ja_gap_sec             = 1.0,   -- アビリティの実行から、次の行動までの秒数 (<wait 1> 相当)
     ja_timeout_sec         = 2.5,   -- アビリティを使ってから、実行を確認できるまで待つ秒数
-    boost_timeout_sec      = 1.5,   -- 気炎万丈の章だけの待ち秒数 (MB 受付に間に合わせるため短く)
+    boost_timeout_sec      = 1.5,   -- 強化 (気炎万丈の章・大悟徹底) の待ち秒数 (MB 受付に間に合わせるため短く)
     ja_retries             = 1,     -- アビリティが実行されなかったときに、もう一度使う回数
     cast_start_timeout_sec = 2.5,   -- 魔法を使ってから、詠唱開始を確認できるまで待つ秒数
     land_timeout_sec       = 12.0,  -- 詠唱開始から、着弾を確認できるまで待つ秒数
+    boost = "ebullience",
+    say = {start = "", mb = "", chain1 = "", chain2 = "", chain3 = "", chain4 = "", chain5 = "", chain6 = ""},
     use_tabula_rasa        = true,  -- 連環計が切れていたら自動で使う (false なら止める)
 }
 local settings = config.load(defaults)
@@ -67,23 +69,32 @@ local SC_WINDOW_BASE_SEC, SC_WINDOW_MIN_SEC, IMMANENCE_BONUS_SEC = 10.0, 4.0, 2.
 local function mb_window_sec(chain_count)
     return math.max(SC_WINDOW_MIN_SEC, SC_WINDOW_BASE_SEC - (chain_count - 1)) + IMMANENCE_BONUS_SEC
 end
+local function finite_number(value)
+    local n = tonumber(value)
+    if n and n == n and math.abs(n) ~= math.huge then return n end
+    return nil
+end
+
 local function clamp_setting(key, value)
     local lim = LIMITS[key]
-    local n = tonumber(value)
+    local n = finite_number(value)
     if not lim or not n then return defaults[key] end
     if n < lim[1] then n = lim[1] elseif n > lim[2] then n = lim[2] end
     if key == "ja_retries" then n = math.floor(n) end
     return n
 end
 for key in pairs(LIMITS) do settings[key] = clamp_setting(key, settings[key]) end
+local BOOST_MODES = {ebullience = true, enlightenment = true, both = true, none = true}
+if not BOOST_MODES[settings.boost] then settings.boost = defaults.boost end
+if type(settings.say) ~= "table" then settings.say = {} end
 
 -- -----------------------------------------------------------------------------
 -- 定数 (番号は Windower の res の値)
 -- -----------------------------------------------------------------------------
-local JA = {TABULA_RASA = 210, DARK_ARTS = 212, EBULLIENCE = 221, IMMANENCE = 317}
+local JA = {TABULA_RASA = 210, DARK_ARTS = 212, EBULLIENCE = 221, ENLIGHTENMENT = 244, IMMANENCE = 317}
 local SPELL = {AERO = 154, STONE = 159, GEOHELIX = 278, ANEMOHELIX = 280, NOCTOHELIX = 284, KAUSTRA = 502}
 local BUFF = {DARK_ARTS = 359, ADDENDUM_BLACK = 402, TABULA_RASA = 377}
-local RECAST = {TABULA_RASA = 0}   -- アビリティのリキャスト番号
+local RECAST = {TABULA_RASA = 0, ENLIGHTENMENT = 235}   -- アビリティのリキャスト番号
 
 local CAST_BEGIN, CAST_INTERRUPT = 24931, 28787         -- category 8 の param
 -- 「Magic Burst!」のメッセージ番号 (res/action_messages.lua で "Magic Burst" を含むもの全部)。
@@ -118,6 +129,60 @@ local function send_input(line)
     windower.send_command(windower.to_shift_jis("input " .. line))
 end
 
+local SAY_MAX_BYTES = 100
+-- start は開始直後、mb はメルトンの入力直前。送信のための待ちは足さない。
+local SAY_KEYS = {"start", "1", "2", "3", "4", "5", "6", "mb"}
+local function say_key(key)
+    if key == "start" or key == "mb" then return key end
+    if key and key:match("^[1-6]$") then return "chain" .. key end
+end
+
+local function validate_say(text)
+    if type(text) ~= "string" then return nil, "セリフは文字列で指定してください" end
+    if text:find("[%c]") or text:find(";", 1, true) then
+        return nil, "セリフに制御文字や半角 ; は使えません"
+    end
+    text = text:match("^%s*(.-)%s*$")
+    if text:sub(1, 1) == "/" then return nil, "セリフを / で始めることはできません" end
+    local ok, encoded = pcall(windower.to_shift_jis, text)
+    if not ok or type(encoded) ~= "string" then return nil, "セリフの文字コードを変換できません" end
+    if #encoded > SAY_MAX_BYTES then return nil, "セリフは Shift-JIS 換算で100バイト以内にしてください" end
+    return text, nil, encoded
+end
+
+for _, key in ipairs(SAY_KEYS) do
+    local internal = say_key(key)
+    -- config が XML の数字・真偽値を型変換するため、検証前にセリフへ戻す。
+    local value = settings.say[internal]
+    if type(value) == "number" then
+        value = string.format("%.14g", value)
+    elseif type(value) == "boolean" then
+        value = tostring(value)
+    elseif type(value) ~= "string" then
+        value = ""
+    end
+    settings.say[internal] = validate_say(value) or ""
+end
+
+local function party_say(key)
+    local text = settings.say[say_key(key)]
+    if not text or text == "" then return end
+    pcall(function()
+        local party = windower.ffxi.get_party() or {}
+        local joined = false
+        for i = 1, 5 do if party["p" .. i] then joined = true; break end end
+        if not joined then return end
+        local valid, _, encoded = validate_say(text)
+        if valid and valid ~= "" then windower.send_command("input /p " .. encoded) end
+    end)
+end
+
+local function boost_warning()
+    if settings.boost == "both" or settings.boost == "enlightenment" then
+        chat("大悟徹底を使うと MB 受付に間に合わない可能性があります。ゲーム内で自分で確かめてください", 167)
+    end
+end
+
 local function has_buff(player, id)
     for _, b in ipairs(player and player.buffs or {}) do
         if b == id then return true end
@@ -149,7 +214,12 @@ local function build_steps()
         table.insert(steps, {kind = "ma", id = c[1], target = "<t>", expect_sc = c[2], chain_no = i})
     end
     -- 気炎万丈の章は威力上げ (boost)。MB 受付に間に合わせるため、使い直しはしない
-    table.insert(steps, {kind = "ja", id = JA.EBULLIENCE, target = "<me>", boost = true})
+    if settings.boost == "enlightenment" or settings.boost == "both" then
+        table.insert(steps, {kind = "ja", id = JA.ENLIGHTENMENT, target = "<me>", boost = true})
+    end
+    if settings.boost == "ebullience" or settings.boost == "both" then
+        table.insert(steps, {kind = "ja", id = JA.EBULLIENCE, target = "<me>", boost = true})
+    end
     table.insert(steps, {kind = "ma", id = SPELL.KAUSTRA, target = "<t>", final = true})
     return steps
 end
@@ -183,6 +253,9 @@ local function precheck()
         if r > 0 then table.insert(problems, string.format("%s の再詠唱まで %.0f秒", spell_name(id), r)) end
     end
     local ja_recasts = windower.ffxi.get_ability_recasts() or {}
+    if (settings.boost == "enlightenment" or settings.boost == "both") and (ja_recasts[RECAST.ENLIGHTENMENT] or 0) > 0 then
+        table.insert(problems, "大悟徹底の再使用待ちです")
+    end
     if not has_buff(player, BUFF.TABULA_RASA) then
         if not settings.use_tabula_rasa then
             table.insert(problems, "連環計の効果中ではありません (メルトンは連環計の効果中のみ詠唱できます)")
@@ -239,9 +312,13 @@ local function send_step(now)
         return
     end
 
-    if step.final and not run.boosted[JA.EBULLIENCE] then
-        stop("気炎万丈の章が実行されませんでした")
-        return
+    if step.final then
+        for _, required in ipairs(run.steps) do
+            if required.boost and not run.boosted[required.id] then
+                stop(ja_name(required.id) .. " が実行されませんでした")
+                return
+            end
+        end
     end
 
     if step.kind == "ma" then
@@ -251,6 +328,7 @@ local function send_step(now)
             stop("ターゲットが変わったか、倒れました")
             return
         end
+        if step.final then party_say("mb") end
         send_input(string.format('/ma "%s" %s', spell_name(step.id), step.target))
         run.phase = "ma_sent"
         run.deadline = now + settings.cast_start_timeout_sec
@@ -340,7 +418,7 @@ local function on_action(act)
 
     if act.category == 6 then
         -- 気炎万丈の章は、ラグで遅れて届いても実行されたものとして数える
-        if act.param == JA.EBULLIENCE then
+        if run.phase == "ja_sent" and step.boost and act.param == step.id then
             run.boosted[act.param] = true
         end
         -- アビリティの実行
@@ -366,6 +444,7 @@ local function on_action(act)
             local late = run.mb_deadline and now > run.mb_deadline
             local used = {}
             if run.boosted[JA.EBULLIENCE] then table.insert(used, "気炎") end
+            if run.boosted[JA.ENLIGHTENMENT] then table.insert(used, "大悟") end
             local boosts = table.concat(used, "・")
             -- 闇門の計 (重力) の着弾からメルトン着弾までの秒数
             local since_sc = run.sc_landed_at and string.format("%.2f秒", now - run.sc_landed_at) or "?"
@@ -385,6 +464,7 @@ local function on_action(act)
                 return
             end
             run.chain_count = step.chain_no
+            party_say(tostring(step.chain_no))
             chat(string.format("%d連目: %s", step.chain_no, sc))
             if sc == "重力" then
                 -- 最後の連携: 硬直が解けるまで post_final_sec 待って気炎万丈の章へ
@@ -394,6 +474,8 @@ local function on_action(act)
                 return
             end
         end
+        -- 1 は起点の着弾確認直後、2～6 は期待した連携の成立確認直後に送る。
+        if step.chain_no == 1 then party_say("1") end
         advance(now, settings.post_land_sec)
     end
 end
@@ -421,6 +503,7 @@ local function start()
         for _, p in ipairs(problems) do chat("・" .. p, 167) end
         return
     end
+    boost_warning()
     player_id = player.id
     run = {
         steps = build_steps(),
@@ -434,6 +517,7 @@ local function start()
         boosted = {},   -- [気炎万丈の章の番号] = 実行された
     }
     chat("開始します → " .. (target.name or "?"))
+    party_say("start")
 end
 
 windower.register_event("zone change", function() stop("エリアを移動しました") end)
@@ -469,14 +553,55 @@ windower.register_event("addon command", function(cmd, ...)
             for _, p in ipairs(problems) do chat("・" .. p, 167) end
         end
 
+    elseif cmd == "boost" then
+        local mode = (args[1] or ""):lower()
+        if not BOOST_MODES[mode] then
+            chat("//m6 boost <ebullience|enlightenment|both|none>", 167)
+            return
+        end
+        settings.boost = mode
+        config.save(settings)
+        chat("boost = " .. mode)
+        boost_warning()
+
+    elseif cmd == "say" then
+        if not args[1] then
+            for _, key in ipairs(SAY_KEYS) do
+                chat("say " .. key .. " = " .. (settings.say[say_key(key)] or ""))
+            end
+            return
+        end
+        local key = say_key(args[1]:lower())
+        if not key or not args[2] then
+            chat("//m6 say <start|1-6|mb> <text|off>", 167)
+            return
+        end
+        local ok, text = pcall(function()
+            return windower.from_shift_jis(windower.convert_auto_trans(table.concat(args, " ", 2)))
+        end)
+        if not ok or type(text) ~= "string" then
+            chat("セリフの文字コードを変換できません", 167)
+            return
+        end
+        if text:lower() == "off" then text = "" end
+        local valid, reason = validate_say(text)
+        if not valid then chat(reason, 167); return end
+        settings.say[key] = valid
+        config.save(settings)
+        chat("say " .. args[1] .. " = " .. valid)
+
     elseif cmd == "tabula" then
         settings.use_tabula_rasa = not settings.use_tabula_rasa
         config.save(settings)
         chat("連環計が切れていたら自動で使う: " .. (settings.use_tabula_rasa and "ON" or "OFF"))
 
-    elseif cmd == "set" and SETTABLE[(args[1] or ""):lower()] and tonumber(args[2]) then
+    elseif cmd == "set" and SETTABLE[(args[1] or ""):lower()] then
         local key = SETTABLE[args[1]:lower()]
-        local want = tonumber(args[2])
+        local want = finite_number(args[2])
+        if not want then
+            chat("有限の数字で指定してください", 167)
+            return
+        end
         settings[key] = clamp_setting(key, want)
         config.save(settings)
         if settings[key] ~= want then
@@ -485,12 +610,15 @@ windower.register_event("addon command", function(cmd, ...)
         chat(string.format("%s = %s", key, tostring(settings[key])))
 
     elseif cmd == "status" then
+        chat("boost = " .. settings.boost)
         chat(string.format("着弾→次 %.1f秒 (重力のあと %.1f秒) / アビ後 %.1f秒 / アビ確認 %.1f秒×再試行%d (気炎 %.1f秒) / 詠唱開始確認 %.1f秒 / 着弾確認 %.1f秒 / 連環計自動 %s",
             settings.post_land_sec, settings.post_final_sec, settings.ja_gap_sec, settings.ja_timeout_sec, settings.ja_retries, settings.boost_timeout_sec,
             settings.cast_start_timeout_sec, settings.land_timeout_sec, settings.use_tabula_rasa and "ON" or "OFF"))
         if run then chat(string.format("実行中: %d/%d", run.index, #run.steps)) end
 
     else
+        chat("//m6 boost <ebullience|enlightenment|both|none>")
+        chat("//m6 say <start|1-6|mb> <text|off>")
         chat("//m6 go      : 6連メルトンを開始 (ゲーム内マクロは /console m6 go)")
         chat("//m6 stop    : 途中で止める")
         chat("//m6 check   : 開始できるか確認だけする (何も実行しない)")

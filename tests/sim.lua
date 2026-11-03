@@ -21,26 +21,31 @@ local function run_world(opts)
     local buffs = opts.buffs or {}
     local target_id = TID
     local zone_events = {}
+    local saved, saves = nil, 0
+    local loaded
     local env
     env = {
         _addon = {}, pairs = pairs, ipairs = ipairs, tonumber = tonumber, tostring = tostring, type = type, pcall = pcall,
         string = string, table = table, math = math, setmetatable = setmetatable, rawget = rawget, select = select, error = error,
         os = {clock = function() return T end},
         require = function(n)
-            if n == 'config' then return {load = function(d) local s = {} for k, v in pairs(d) do s[k] = v end for k, v in pairs(opts.settings or {}) do s[k] = v end return s end, save = function() end} end
+            if n == 'config' then return {load = function(d) local s = {} for k, v in pairs(d) do s[k] = v end for k, v in pairs(opts.settings or {}) do s[k] = v end loaded = s; return s end, save = function(value) saved = value; saves = saves + 1 end} end
             if n == 'resources' then return {job_abilities = res_ja, spells = res_sp} end
             error('no module ' .. n)
         end,
         windower = {
-            to_shift_jis = function(s) return s end,
+            to_shift_jis = function(s) return opts.encode and opts.encode(s) or s end,
+            from_shift_jis = function(s) return opts.decode and opts.decode(s) or s end,
+            convert_auto_trans = function(s) return opts.auto_translate and opts.auto_translate(s) or s end,
             register_event = function(ev, fn) handlers[ev] = handlers[ev] or {}; table.insert(handlers[ev], fn) end,
             add_to_chat = function(c, t) chat[#chat + 1] = t end,
             send_command = function(c) sent[#sent + 1] = {t = T, cmd = c} end,
             ffxi = {
+                get_party = function() if opts.solo then return {p0 = {name = "Me"}} end return {p0 = {name = "Me"}, p1 = {name = "Friend"}} end,
                 get_player = function() return {id = ME, main_job = 'SCH', status = 1, buffs = buffs, vitals = {mp = 2000, max_mp = 2000}} end,
                 get_mob_by_target = function() if opts.no_target then return nil end return {id = target_id, name = 'Mob', valid_target = true, hpp = 100, spawn_type = 16, distance = 100} end,
                 get_spell_recasts = function() return {} end,
-                get_ability_recasts = function() return {} end,
+                get_ability_recasts = function() return opts.recasts or {} end,
             },
         },
     }
@@ -49,12 +54,15 @@ local function run_world(opts)
     local function fire(ev, ...) for _, fn in ipairs(handlers[ev] or {}) do fn(...) end end
     local function after(d, fn) queue[#queue + 1] = {at = T + d, fn = fn} end
     local W = {sent = sent, chat = chat, fire = fire}
+    W.saved = function() return saved, saves end
+    W.loaded = function() return loaded end
     local n_ja, n_ma = 0, 0
     local behave = opts.behave or function() return {} end
     W.set_target = function(id) target_id = id end
     -- 入力の送信を、応答に変える
     local orig_send = env.windower.send_command
     env.windower.send_command = function(c)
+        if c:match("^input /p ") and opts.say_error then error("party send failed") end
         orig_send(c)
         local kind, name = c:match('^input /(%a+) "([^"]+)"')
         if kind == 'ja' then
@@ -227,6 +235,226 @@ do
     local W = run_world({buffs = {377, 359}, settings = {ja_retries = 99, post_land_sec = -3, ja_gap_sec = 0}, behave = function(k, id, n) if k == 'ja' then return nil end return {} end})
     W.go(); W.run_until(300)
     check(#W.sent <= 4, "S11 settings.xml の ja_retries=99 でも、使い直しは少数 (実際 " .. #W.sent .. ")")
+end
+
+-- 強化の選択とセリフの保存・入力検査・送信を確かめる。
+
+for _, mode in ipairs{"ebullience", "enlightenment", "both", "none"} do
+    local W = run_world({settings = {boost = mode}, buffs = {377, 359}})
+    W.go(); W.run_until(120)
+    local suffix = {}
+    for _, v in ipairs(W.sent) do
+        local name = v.cmd:match('^input /ja "([^"]+)"')
+        if name == res_ja[221].ja or name == res_ja[244].ja then suffix[#suffix + 1] = name end
+    end
+    local expected = mode == "both" and {res_ja[244].ja, res_ja[221].ja} or
+        mode == "none" and {} or {res_ja[mode == "enlightenment" and 244 or 221].ja}
+    check(table.concat(suffix, ",") == table.concat(expected, ","), "boost sequence: " .. mode)
+    check(W.sent[#W.sent].cmd:find(res_sp[502].ja, 1, true), "final spell: " .. mode)
+    W.fire('addon command', 'status')
+    check(W.log_has('boost = ' .. mode), "status: " .. mode)
+end
+for _, mode in ipairs{"enlightenment", "both"} do
+    local W = run_world({settings = {boost = mode}, buffs = {377, 359}, behave = function(k, id)
+        if k == 'ja' and id == 244 then return nil end return {} end})
+    W.go(); W.run_until(120)
+    local n = 0
+    for _, v in ipairs(W.sent) do
+        check(not v.cmd:find(res_sp[502].ja, 1, true), "failed boost blocks final spell")
+        check(not v.cmd:find(res_ja[221].ja, 1, true), "failed first boost blocks second")
+        if v.cmd:find(res_ja[244].ja, 1, true) then n = n + 1 end
+    end
+    check(n == 1, "failed boost is not retried")
+end
+for _, mode in ipairs{"ebullience", "enlightenment", "both", "none"} do
+    local W = run_world()
+    W.fire('addon command', 'boost', mode)
+    local saved, count = W.saved()
+    check(saved and saved.boost == mode and count == 1, "boost saved: " .. mode)
+    saved = saved or {}
+    W.fire('addon command', 'boost', 'immanence')
+    local _, after = W.saved()
+    check(after == count and saved.boost == mode, "invalid boost preserves settings")
+end
+local function say_lines(W)
+    local result = {}
+    for _, v in ipairs(W.sent) do if v.cmd:match('^input /p ') then result[#result + 1] = v end end
+    return result
+end
+do
+    local W = run_world({buffs = {377, 359}})
+    W.fire('addon command', 'say')
+    local _, count = W.saved()
+    check(count == 0, "listing does not save")
+    for _, key in ipairs{'start','1','2','3','4','5','6','mb'} do
+        W.fire('addon command', 'say', key, 'line-' .. key)
+    end
+    local saved, count = W.saved()
+    check(saved and count == 8 and saved.say.chain1 == 'line-1', "say settings saved")
+    saved = saved or {say = {}}
+    W.go(); W.run_until(120)
+    local lines = say_lines(W)
+    check(#lines == 8, "all eight say keys sent")
+    local keys = {'start','1','2','3','4','5','6','mb'}
+    for i, entry in ipairs(lines) do check(entry.cmd == 'input /p line-' .. keys[i], "say order " .. i) end
+    check(lines[1] and lines[1].t == 0, "start say is immediate")
+    local last = W.sent[#W.sent]
+    check(lines[8] and lines[8].t == last.t, "mb say adds no wait")
+    W.fire('addon command', 'say', 'start', 'off')
+    check(saved.say.start == '', "off clears say")
+end
+do
+    local W = run_world()
+    W.fire('addon command', 'say', 'start', 'keep')
+    local saved, before = W.saved()
+    saved = saved or {say = {}}
+    for _, text in ipairs{'/echo unsafe', '  /echo unsafe', 'hello;input /echo unsafe', 'line\nnext', 'line\rnext', 'line\tnext', string.char(0), string.char(127), string.rep('a', 101)} do
+        local n = #W.chat
+        W.fire('addon command', 'say', 'start', text)
+        local _, count = W.saved()
+        check(count == before and saved.say.start == 'keep', "unsafe say rejected")
+        check(#W.chat == n + 1, "one refusal message")
+    end
+    W.fire('addon command', 'say', 'start', string.rep('a', 100))
+    check(saved.say.start and #saved.say.start == 100, "100 byte say accepted")
+end
+for _, opts in ipairs{{solo = true}, {say_error = true}} do
+    opts.settings = {say = {start = 'text', mb = 'text'}}
+    opts.buffs = {377, 359}
+    local W = run_world(opts)
+    W.go(); W.run_until(120)
+    check(#say_lines(W) == 0, "solo or send failure emits no party text")
+    check(W.sent[#W.sent].cmd:find(res_sp[502].ja, 1, true), "say failure does not stop sequence")
+end
+for _, event in ipairs{'zone change','unload','logout'} do
+    local W = run_world({settings = {say = {mb = 'not sent'}}})
+    W.go(); W.run_until(3)
+    local count = #W.sent
+    W.fire(event); W.run_until(120)
+    check(#W.sent == count, "cleanup stops all sends: " .. event)
+end
+do
+    local W = run_world({settings = {boost = 'enlightenment'}, recasts = {[235] = 10}})
+    W.go(); W.run_until(120)
+    check(#W.sent == 0, "Enlightenment cooldown prevents starting")
+end
+
+
+do
+    local W = run_world({buffs = {377, 359}})
+    W.go(); W.run_until(120)
+    check(#say_lines(W) == 0, "default say text is empty")
+end
+do
+    local W = run_world({buffs = {377, 359}, settings = {say = {chain2 = 'unconfirmed'}},
+        behave = function(k, id, n) if k == 'ma' and n == 2 then return {sc = false} end return {} end})
+    W.go(); W.run_until(120)
+    check(#say_lines(W) == 0, "no say for an unconfirmed skillchain")
+end
+do
+    local W = run_world({settings = {say = {start = '/unsafe', mb = 'bad;command'}}})
+    W.go(); W.run_until(120)
+    check(#say_lines(W) == 0, "loaded unsafe say text is disabled")
+end
+do
+    local W = run_world({encode = function(s) return string.rep('x', #s * 2) end})
+    W.fire('addon command', 'say', 'start', string.rep('a', 50))
+    local saved, count = W.saved()
+    check(saved and #saved.say.start == 50 and count == 1, "encoded 100 bytes accepted")
+    W.fire('addon command', 'say', 'start', string.rep('a', 51))
+    local _, after = W.saved()
+    check(after == count, "encoded 102 bytes rejected")
+end
+
+
+do
+    local W = run_world({settings = {boost = 'both'}, buffs = {377, 359}, behave = function(k, id)
+        if k == 'ja' and id == 221 then return nil end return {} end})
+    W.go(); W.run_until(120)
+    local n = 0
+    for _, entry in ipairs(W.sent) do
+        check(not entry.cmd:find(res_sp[502].ja, 1, true), "second failed boost blocks final spell")
+        if entry.cmd:find(res_ja[221].ja, 1, true) then n = n + 1 end
+    end
+    check(n == 1, "second boost is not retried")
+end
+do
+    local W = run_world({encode = function(s) if s == 'text' then error('conversion failed') end return s end})
+    W.fire('addon command', 'say', 'start', 'text')
+    local _, count = W.saved()
+    check(count == 0, "encoding failure does not save")
+end
+
+
+do
+    local utf8_a, sjis_a = "\227\129\130", "\130\160"
+    local W = run_world({encode = function(s) return (s:gsub(utf8_a, sjis_a)) end})
+    W.fire('addon command', 'say', 'start', string.rep(utf8_a, 50))
+    local saved, before = W.saved()
+    check(saved and saved.say.start == string.rep(utf8_a, 50), "UTF-8 text stored before conversion")
+    W.fire('addon command', 'say', 'start', string.rep(utf8_a, 51))
+    local _, after = W.saved()
+    check(after == before, "multi-byte text rejected above 100 encoded bytes")
+    W.go(); W.run_until(120)
+    local lines = say_lines(W)
+    check(lines[1] and lines[1].cmd == 'input /p ' .. string.rep(sjis_a, 50), "party text uses encoded bytes")
+    local shown = false
+    for _, line in ipairs(W.chat) do if line:find(sjis_a, 1, true) then shown = true end end
+    check(shown, "say confirmation uses encoded bytes")
+end
+
+
+do
+    local utf8_a, sjis_a = "\227\129\130", "\130\160"
+    local W = run_world({decode = function(s) return (s:gsub(sjis_a, utf8_a)) end,
+        auto_translate = function(s) return (s:gsub('TOKEN', sjis_a)) end,
+        encode = function(s) return (s:gsub(utf8_a, sjis_a)) end})
+    W.fire('addon command', 'say', 'start', string.rep(sjis_a, 50))
+    local saved, count = W.saved()
+    check(saved and saved.say.start == string.rep(utf8_a, 50), "Shift-JIS input stored as UTF-8")
+    W.fire('addon command', 'say', 'mb', 'TOKEN')
+    check(saved and saved.say.mb == utf8_a, "auto-translate expanded before decoding")
+    W.go(); W.run_until(120)
+    local lines = say_lines(W)
+    check(lines[1] and lines[1].cmd == 'input /p ' .. string.rep(sjis_a, 50), "Shift-JIS input round trip")
+end
+do
+    local W = run_world({decode = function() error('decode failed') end})
+    W.fire('addon command', 'say', 'start', 'bad')
+    local _, count = W.saved()
+    check(count == 0 and #W.chat == 1, "decode error refused without saving")
+end
+
+
+do
+    local W = run_world({settings = {say = {start = 123, mb = true, chain1 = 3.0,
+        chain2 = false, chain3 = {}, chain4 = nil}}})
+    local loaded = W.loaded()
+    check(loaded.say.start == '123', "numeric say survives loading")
+    check(loaded.say.mb == 'true', "true say survives loading")
+    check(loaded.say.chain1 == '3', "integer say has no decimal suffix")
+    check(loaded.say.chain2 == 'false', "false say survives loading")
+    check(loaded.say.chain3 == '' and loaded.say.chain4 == '', "table and nil say load as empty")
+    W.go(); W.run_until(120)
+    local lines = say_lines(W)
+    check(#lines == 4, "loaded numeric and boolean say are sent")
+    check(lines[1] and lines[1].cmd == 'input /p 123', "loaded numeric say output")
+end
+for _, invalid in ipairs{0/0, math.huge, -math.huge, 'nan', 'inf', '-inf', 'abc'} do
+    local W = run_world()
+    W.fire('addon command', 'set', 'post', '4')
+    local saved, count = W.saved()
+    W.fire('addon command', 'set', 'post', invalid)
+    local _, after = W.saved()
+    check(after == count and saved.post_land_sec == 4, "non-finite or invalid set preserves value")
+    check(W.log_has("有限の数字で指定してください"), "invalid set explains numeric input")
+end
+for _, invalid in ipairs{0/0, math.huge, -math.huge, 'nan', 'inf', '-inf'} do
+    local W = run_world({settings = {post_land_sec = invalid}})
+    check(W.loaded().post_land_sec == 3.0, "non-finite loaded setting uses default")
+    local _, count = W.saved()
+    check(count == 0, "invalid loaded setting does not save")
+    check(#W.chat == 0, "invalid loaded setting is silent")
 end
 
 -- ファジング: 応答の欠落・遅延・重複・不一致をランダムに起こして、不変条件を確かめる
