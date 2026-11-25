@@ -511,10 +511,11 @@ local function on_action(act)
         end
 
     elseif act.category == 8 then
-        local a = act.targets and act.targets[1] and act.targets[1].actions and act.targets[1].actions[1]
+        local first = type(act.targets) == "table" and act.targets[1]
+        local a = type(first) == "table" and first.actions and first.actions[1]
         if act.param == CAST_INTERRUPT and (run.phase == "ma_sent" or run.phase == "casting") then
             stop("詠唱が中断されました")
-        elseif act.param == CAST_BEGIN and run.phase == "ma_sent" and a and a.param == step.id then
+        elseif act.param == CAST_BEGIN and run.phase == "ma_sent" and first.id == run.target_id and a and a.param == step.id then
             run.phase = "casting"
             run.deadline = now + settings.land_timeout_sec
         end
@@ -532,7 +533,7 @@ local function on_action(act)
             local used = {}
             if run.boosted[JA.EBULLIENCE] then table.insert(used, "気炎") end
             if run.boosted[JA.ENLIGHTENMENT] then table.insert(used, "大悟") end
-            local boosts = table.concat(used, "・")
+            local boosts = #used > 0 and table.concat(used, "・") or "強化なし"
             -- 闇門の計 (重力) の着弾からメルトン着弾までの秒数
             local since_sc = run.sc_landed_at and string.format("%.2f秒", now - run.sc_landed_at) or "?"
             local window = string.format("受付 %.1f秒", mb_window_sec(run.chain_count))
@@ -618,6 +619,7 @@ local function start()
 end
 
 windower.register_event("zone change", function() stop("エリアを移動しました") end)
+windower.register_event("job change", function() stop("ジョブが変更されました") end)
 windower.register_event("status change", function(new)
     if run and (new == 2 or new == 3) then stop("戦闘不能になりました") end   -- 2: 戦闘不能 / 3: 戦闘不能 (戦闘中)
 end)
