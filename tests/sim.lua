@@ -6,6 +6,7 @@ local function check(c, m) total = total + 1; if not c then fails = fails + 1; i
 
 local res_ja = assert(loadfile(RESDIR .. '/job_abilities.lua'))()
 local res_sp = assert(loadfile(RESDIR .. '/spells.lua'))()
+local res_bf = assert(loadfile(RESDIR .. '/buffs.lua'))()
 local JA_ID, SP_ID = {}, {}
 for id, r in pairs(res_ja) do if type(r) == 'table' and r.ja then JA_ID[r.ja] = id end end
 for id, r in pairs(res_sp) do if type(r) == 'table' and r.ja then SP_ID[r.ja] = id end end
@@ -14,23 +15,83 @@ local ME, TID = 1, 500
 local SC_MSG = {['切断'] = 299, ['炸裂'] = 300, ['重力'] = 290}
 local SC_OF_N = {[1] = false, [2] = '切断', [3] = '炸裂', [4] = '切断', [5] = '炸裂', [6] = '重力'}   -- 魔法の何発目か (使い直しの無い通常時)
 
+-- config の模擬 (libs/config.lua の動きに合わせる):
+--   ・settings.xml の値は文字列。読むときに true/false → 真偽値、数字 → 数値 に変える (settings_table)
+--   ・読み込み (load)・ログイン・ログアウトのたびに読み直し、同じ表に上書きする (merge)。そのあと register の関数を呼ぶ
+--   ・merge は、元が数値で XML が数字でない文字列なら 16 進数として読む (abc → 2748)。読めなければ文字列のまま入れる
+--   ・global のあとにキャラクター別 (名前の小文字) の値を重ねる。保存はキャラクター別に書く
+--   ・ログインしていないと save は何もしない
+local function xml_value(v)
+    if type(v) == 'table' then local t = {} for k, x in pairs(v) do t[k] = xml_value(x) end return t end
+    if type(v) ~= 'string' then return v end
+    if v:lower() == 'true' then return true elseif v:lower() == 'false' then return false end
+    local n = tonumber(v)
+    if n ~= nil then return n end
+    return v
+end
+local function xml_text(v)
+    if type(v) == 'table' then local t = {} for k, x in pairs(v) do t[k] = xml_text(x) end return t end
+    return tostring(v)
+end
+local function config_merge(t, m)
+    for k, v in pairs(m or {}) do
+        local old = rawget(t, k)
+        if type(old) == 'table' and type(v) == 'table' then config_merge(old, v)
+        elseif old ~= nil and type(old) ~= type(v) then
+            if type(old) == 'number' and type(v) == 'string' then t[k] = tonumber(v) or tonumber(v, 16) or v
+            elseif type(old) == 'string' and type(v) == 'table' and next(v) == nil then t[k] = ''
+            else t[k] = v end
+        else t[k] = v end
+    end
+end
+local function deep_copy(v)
+    if type(v) ~= 'table' then return v end
+    local t = {} for k, x in pairs(v) do t[k] = deep_copy(x) end return t
+end
+
 -- 世界を作る。behave(kind, id, n) が応答を決める: nil = 応答しない / table = {delay=, ...}
 local function run_world(opts)
     opts = opts or {}
     local T, queue, handlers, sent, chat = 0, {}, {}, {}, {}
     local buffs = opts.buffs or {}
     local target_id = TID
-    local zone_events = {}
     local saved, saves = nil, 0
     local loaded
+    local logged_in = not opts.logged_out
+    local file = deep_copy(opts.xml or {})   -- settings.xml の中身 {global = {...}, me = {...}} (値は文字列)
+    local refresh = {}
     local env
+    local function reload()
+        if not loaded then return end
+        config_merge(loaded, xml_value(file.global))
+        if logged_in then config_merge(loaded, xml_value(file.me)) end
+        for _, fn in ipairs(refresh) do fn(loaded) end
+    end
     env = {
         _addon = {}, pairs = pairs, ipairs = ipairs, tonumber = tonumber, tostring = tostring, type = type, pcall = pcall,
         string = string, table = table, math = math, setmetatable = setmetatable, rawget = rawget, select = select, error = error,
         os = {clock = function() return T end},
         require = function(n)
-            if n == 'config' then return {load = function(d) local s = {} for k, v in pairs(d) do s[k] = v end for k, v in pairs(opts.settings or {}) do s[k] = v end loaded = s; return s end, save = function(value) saved = value; saves = saves + 1 end} end
-            if n == 'resources' then return {job_abilities = res_ja, spells = res_sp} end
+            if n == 'config' then
+                for _, ev in ipairs{'load', 'login', 'logout'} do handlers[ev] = handlers[ev] or {}; table.insert(handlers[ev], reload) end
+                return {
+                    load = function(d)
+                        local s = deep_copy(d)
+                        for k, v in pairs(opts.settings or {}) do s[k] = deep_copy(v) end
+                        loaded = s
+                        config_merge(s, xml_value(file.global))
+                        if logged_in then config_merge(s, xml_value(file.me)) end
+                        return s
+                    end,
+                    save = function(value)
+                        if not logged_in then return end
+                        saved = value; saves = saves + 1
+                        file.me = xml_text(value)
+                    end,
+                    register = function(_, fn) refresh[#refresh + 1] = fn end,
+                }
+            end
+            if n == 'resources' then return {job_abilities = res_ja, spells = res_sp, buffs = res_bf} end
             error('no module ' .. n)
         end,
         windower = {
@@ -42,7 +103,8 @@ local function run_world(opts)
             send_command = function(c) sent[#sent + 1] = {t = T, cmd = c} end,
             ffxi = {
                 get_party = function() if opts.solo then return {p0 = {name = "Me"}} end return {p0 = {name = "Me"}, p1 = {name = "Friend"}} end,
-                get_player = function() return {id = ME, main_job = 'SCH', status = 1, buffs = buffs, vitals = {mp = 2000, max_mp = 2000}} end,
+                get_player = function() return {id = ME, name = 'Me', main_job = 'SCH', status = 1, buffs = buffs, vitals = {mp = 2000, max_mp = 2000}} end,
+                get_info = function() return {logged_in = logged_in} end,
                 get_mob_by_target = function() if opts.no_target then return nil end return {id = target_id, name = 'Mob', valid_target = true, hpp = 100, spawn_type = 16, distance = 100} end,
                 get_spell_recasts = function() return {} end,
                 get_ability_recasts = function() return opts.recasts or {} end,
@@ -52,10 +114,16 @@ local function run_world(opts)
     env._G = env
     local chunk = assert(loadfile(SRC)); setfenv(chunk, env); chunk()
     local function fire(ev, ...) for _, fn in ipairs(handlers[ev] or {}) do fn(...) end end
+    fire('load')   -- Windower は読み込みの直後に load を起こす (config はここで settings.xml を読み直す)
     local function after(d, fn) queue[#queue + 1] = {at = T + d, fn = fn} end
     local W = {sent = sent, chat = chat, fire = fire}
     W.saved = function() return saved, saves end
     W.loaded = function() return loaded end
+    W.file = function() return file end
+    W.login = function() logged_in = true; fire('login') end
+    W.logout = function() logged_in = false; fire('logout') end
+    -- 自分以外 (actor) や別の魔法の action を、そのまま起こす
+    W.inject = function(d, act) after(d, function() fire('action', act) end) end
     local n_ja, n_ma = 0, 0
     local behave = opts.behave or function() return {} end
     W.set_target = function(id) target_id = id end
@@ -214,7 +282,7 @@ do
     W.go()
     check(W.log_has('実行中です'), "S9 実行中の再起動は断る")
     W.fire('addon command', 'stop'); W.run_until(60)
-    check(#W.sent <= n + 1, "S9 //m6 stop のあとは送らない")
+    check(#W.sent == n, "S9 //m6 stop のあとは送らない (止める前 " .. n .. " / 後 " .. #W.sent .. ")")
 end
 
 -- S10 設定の値: 不正な値で、入力が大量に送られない
@@ -289,7 +357,7 @@ do
     for _, key in ipairs{'start','1','2','3','4','5','6','mb'} do
         W.fire('addon command', 'say', key, 'line-' .. key)
     end
-    local saved, count = W.saved()
+    local saved; saved, count = W.saved()
     check(saved and count == 8 and saved.say.chain1 == 'line-1', "say settings saved")
     saved = saved or {say = {}}
     W.go(); W.run_until(120)
@@ -410,7 +478,7 @@ do
         auto_translate = function(s) return (s:gsub('TOKEN', sjis_a)) end,
         encode = function(s) return (s:gsub(utf8_a, sjis_a)) end})
     W.fire('addon command', 'say', 'start', string.rep(sjis_a, 50))
-    local saved, count = W.saved()
+    local saved = W.saved()
     check(saved and saved.say.start == string.rep(utf8_a, 50), "Shift-JIS input stored as UTF-8")
     W.fire('addon command', 'say', 'mb', 'TOKEN')
     check(saved and saved.say.mb == utf8_a, "auto-translate expanded before decoding")
@@ -457,6 +525,187 @@ for _, invalid in ipairs{0/0, math.huge, -math.huge, 'nan', 'inf', '-inf'} do
     check(#W.chat == 0, "invalid loaded setting is silent")
 end
 
+-- ---------------------------------------------------------------------------
+-- 独立レビューの指摘への確認 (R + 指摘の番号)
+-- ---------------------------------------------------------------------------
+local function count_log(W, s) local n = 0 for _, c in ipairs(W.chat) do if c:find(s, 1, true) then n = n + 1 end end return n end
+local function sent_name(W, name) for _, n in ipairs(W.names()) do if n == name then return true end end return false end
+
+-- R1 settings.xml の範囲外・数字でない値は、読み直し (load・logout・login) のあとも範囲に収まる
+do
+    local W = run_world({buffs = {377, 359}, xml = {global = {ja_retries = '99', post_land_sec = '-3', ja_gap_sec = '0', land_timeout_sec = 'zz'}},
+        behave = function(k) if k == 'ja' then return nil end return {} end})
+    local s = W.loaded()
+    check(s.ja_retries == 2 and s.post_land_sec == 0 and s.ja_gap_sec == 0.5,
+        string.format("R1 load の読み直しのあとも範囲内 (retries %s / post %s / gap %s)", tostring(s.ja_retries), tostring(s.post_land_sec), tostring(s.ja_gap_sec)))
+    check(s.land_timeout_sec == 12.0, "R1 数字でない文字列 (zz) は既定値に戻す (実際 " .. tostring(s.land_timeout_sec) .. ")")
+    W.logout(); W.login()
+    check(s.ja_retries == 2, "R1 ログアウト・ログインの読み直しのあとも範囲内 (実際 " .. tostring(s.ja_retries) .. ")")
+    local ok = pcall(function() W.go(); W.run_until(300) end)
+    check(ok and #W.sent == 3, "R1 ja_retries=99 でも使い直しは 2 回まで (実際 " .. #W.sent .. " 回送った)")
+end
+do
+    -- config は、元が数値の項目に数字でない文字列が来ると 16 進数として読む (abc → 2748)。それでも範囲に収める
+    local W = run_world({xml = {global = {ja_retries = 'abc', post_land_sec = 'abc'}}})
+    local s = W.loaded()
+    check(type(s.ja_retries) == 'number' and s.ja_retries >= 0 and s.ja_retries <= 2 and s.ja_retries % 1 == 0,
+        "R1 ja_retries=abc は読み直しのあとも 0〜2 の整数 (実際 " .. tostring(s.ja_retries) .. ")")
+    check(type(s.post_land_sec) == 'number' and s.post_land_sec >= 0 and s.post_land_sec <= 10,
+        "R1 post_land_sec=abc は読み直しのあとも 0〜10 (実際 " .. tostring(s.post_land_sec) .. ")")
+end
+do
+    -- キャラクター別の値も同じ。boost と use_tabula_rasa の型も直す
+    local W = run_world({xml = {global = {ja_retries = '1'}, me = {ja_retries = '99', boost = 'bogus', use_tabula_rasa = 'yes'}}})
+    local s = W.loaded()
+    check(s.ja_retries == 2, "R1 キャラクター別の ja_retries=99 も範囲内 (実際 " .. tostring(s.ja_retries) .. ")")
+    check(s.boost == 'ebullience', "R1 知らない boost は既定値 (実際 " .. tostring(s.boost) .. ")")
+    check(s.use_tabula_rasa == true, "R1 真偽値でない use_tabula_rasa は既定値 (実際 " .. tostring(s.use_tabula_rasa) .. ")")
+    local ok = pcall(W.fire, 'addon command', 'status')
+    check(ok, "R1 status が落ちない")
+end
+do
+    local W = run_world()
+    W.fire('addon command', 'set', 'retries', '2'); W.fire('addon command', 'set', 'post', '4.5')
+    W.logout(); W.login()
+    check(W.loaded().ja_retries == 2 and W.loaded().post_land_sec == 4.5, "R1 保存した値は読み直しのあとも同じ")
+end
+
+-- R2 数字・真偽値だけのセリフは、保存して読み直したあとも文字列
+do
+    local W = run_world({buffs = {377, 359}})
+    W.fire('addon command', 'say', 'start', '123')
+    W.fire('addon command', 'say', 'mb', 'true')
+    check(W.file().me and W.file().me.say.start == '123', "R2 settings.xml には 123 が書かれる")
+    W.logout(); W.login()
+    local s = W.loaded()
+    check(type(s.say.start) == 'string' and s.say.start == '123', "R2 say start=123 は読み直しのあとも文字列 (実際 " .. type(s.say.start) .. ")")
+    check(s.say.mb == 'true', "R2 say mb=true は読み直しのあとも文字列 (実際 " .. type(s.say.mb) .. ")")
+    local ok = pcall(W.fire, 'addon command', 'say')
+    check(ok and W.log_has('say mb = true'), "R2 //m6 say の一覧が落ちない")
+    W.go(); W.run_until(120)
+    local lines = say_lines(W)
+    check(lines[1] and lines[1].cmd == 'input /p 123', "R2 読み直したセリフ 123 を送る")
+    check(lines[#lines] and lines[#lines].cmd == 'input /p true', "R2 読み直したセリフ true を送る")
+end
+do
+    -- 読み直しで入った危ないセリフも、検査で空にする
+    local W = run_world({xml = {global = {say = {start = '/echo x', mb = 'a;b'}}}})
+    check(W.loaded().say.start == '' and W.loaded().say.mb == '', "R2 読み直した危ないセリフは空にする")
+    -- 数値にすると形が変わるもの (007 → 7) は戻せない。落ちずに文字列になることだけを確かめる
+    local W2 = run_world({xml = {global = {say = {chain1 = '007'}}}})
+    check(W2.loaded().say.chain1 == '7', "R2 007 は 7 になる (config の型変換・既知の制限)")
+end
+
+-- R3 開始前の確認: 黒のグリモアの再使用・行動を妨げる状態異常・連環計の残り時間の知らせ
+do
+    local W = run_world({buffs = {377}, recasts = {[232] = 30}})
+    W.go(); W.run_until(30)
+    check(#W.sent == 0 and W.log_has('黒のグリモアの再使用まで 30秒'), "R3 黒のグリモアの再使用中は始めない (送った " .. #W.sent .. ")")
+    local W2 = run_world({buffs = {377, 359}, recasts = {[232] = 30}})
+    W2.go(); W2.run_until(5)
+    check(#W2.sent > 0, "R3 黒のグリモアの効果中なら、その再使用は見ない")
+end
+for _, b in ipairs{{6, '静寂'}, {29, '沈黙'}, {16, 'アムネジア'}, {2, '睡眠'}, {10, 'スタン'}, {7, '石化'}, {28, 'テラー'}, {14, '魅了'}} do
+    local W = run_world({buffs = {377, 359, b[1]}})
+    W.go(); W.run_until(30)
+    check(#W.sent == 0 and W.log_has(b[2] .. ' のため行動できません'), "R3 " .. b[2] .. " 中は始めない (送った " .. #W.sent .. ")")
+end
+do
+    local W = run_world({buffs = {377, 359}})
+    W.go()
+    check(W.log_has('残り時間は取れないため'), "R3 連環計の効果中から始めるときは、残りを確かめるよう知らせる")
+    local W2 = run_world()
+    W2.go()
+    check(not W2.log_has('残り時間は取れないため'), "R3 連環計を使うところから始めるときは知らせない")
+end
+
+-- R4 MB 受付に最短の詠唱でも間に合わないなら、メルトン (と mb のセリフ) を送らない
+do
+    -- 重力の着弾 + 5.0 (postfinal) + 0.3 (気炎の実行) + 1.5 (gap) = 6.8 秒で送る。最短の詠唱 1.0 秒で 7.8 > 7.0
+    local W = run_world({buffs = {377, 359}, settings = {post_final_sec = 5, ja_gap_sec = 1.5, say = {mb = 'mb-line'}}})
+    W.go(); W.run_until(120)
+    check(not sent_name(W, 'メルトン'), "R4 受付切れが確定していればメルトンを送らない")
+    check(W.log_has('MB 受付に間に合わないため'), "R4 理由を知らせる")
+    check(#say_lines(W) == 0, "R4 mb のセリフも送らない")
+    -- 5.8 秒で送るなら、最短の詠唱 1.0 秒で 6.8 < 7.0: 送る
+    local W2 = run_world({buffs = {377, 359}, settings = {post_final_sec = 5, ja_gap_sec = 0.5}})
+    W2.go(); W2.run_until(120)
+    check(sent_name(W2, 'メルトン'), "R4 最短の詠唱で間に合うなら送る")
+end
+
+-- R8 詠唱開始 (category 8) を取りこぼしても、自分の同じ魔法の着弾で進む
+do
+    local W = run_world({buffs = {377, 359}, behave = function(k, id) if k == 'ma' then return {begin = false, mb = id == 502} end return {} end})
+    W.go(); W.run_until(120)
+    check(#W.sent == 14 and W.log_has('マジックバースト成功'), "R8 詠唱開始が届かなくても、着弾で最後まで進む (送った " .. #W.sent .. ")")
+end
+-- 他人の action・別の魔法の着弾では進まない
+for _, case in ipairs{'other_actor', 'other_spell', 'other_spell_no_begin'} do
+    local W
+    W = run_world({buffs = {377, 359}, behave = function(k, id, n)
+        if k == 'ma' and n == 1 then
+            if case == 'other_actor' then
+                W.inject(0.3, {category = 8, actor_id = 77, param = 24931, targets = {{id = TID, actions = {{param = id}}}}})
+                W.inject(1.0, {category = 4, actor_id = 77, param = id, targets = {{id = TID, actions = {{message = 2}}}}})
+            else
+                if case == 'other_spell' then
+                    W.inject(0.3, {category = 8, actor_id = ME, param = 24931, targets = {{id = TID, actions = {{param = id}}}}})
+                end
+                W.inject(1.0, {category = 4, actor_id = ME, param = 159, targets = {{id = TID, actions = {{message = 2}}}}})
+            end
+            return nil
+        end
+        return {}
+    end})
+    W.go(); W.run_until(60)
+    check(#W.sent == 2 and not sent_name(W, 'ストーン') and W.log_has('中止しました'), "R8 " .. case .. " では進まずに止まる (送った " .. #W.sent .. ")")
+end
+
+-- R9 ログイン前は保存されないことを知らせる
+do
+    local W = run_world({logged_out = true})
+    W.fire('addon command', 'boost', 'none')
+    W.fire('addon command', 'set', 'post', '4')
+    W.fire('addon command', 'tabula')
+    W.fire('addon command', 'say', 'start', 'x')
+    local _, count = W.saved()
+    check(count == 0, "R9 ログイン前は保存しない")
+    check(count_log(W, '保存されません') == 4, "R9 4 つのコマンドそれぞれで、保存されないことを知らせる (実際 " .. count_log(W, '保存されません') .. ")")
+    local W2 = run_world()
+    W2.fire('addon command', 'boost', 'none')
+    check(not W2.log_has('保存されません'), "R9 ログイン中は知らせない")
+end
+
+-- R10 retries は整数だけ / set の名前違いは理由を出す / ヘルプに全部の set がある
+do
+    local W = run_world()
+    W.fire('addon command', 'set', 'retries', '1.5')
+    local _, count = W.saved()
+    check(W.loaded().ja_retries == 1 and count == 0 and W.log_has('整数で'), "R10 retries 1.5 は受け付けない")
+    W.fire('addon command', 'set', 'retries', '2')
+    check(W.loaded().ja_retries == 2, "R10 retries 2 は受け付ける")
+    W.fire('addon command', 'set', 'retry', '1')
+    check(W.log_has('設定の名前が違います: retry'), "R10 set の名前違いは理由を出す")
+    W.fire('addon command')
+    for _, k in ipairs{'post', 'postfinal', 'gap', 'jatimeout', 'boosttimeout', 'retries', 'casttimeout', 'landtimeout'} do
+        check(W.log_has('//m6 set ' .. k .. ' '), "R10 ヘルプに set " .. k .. " がある")
+    end
+end
+
+-- R6 制御文字 (0x00-0x1F・0x7F) はすべて断る。0x80 以上のバイト (Shift-JIS など) は断らない
+do
+    local W = run_world()
+    for b = 0, 31 do
+        W.fire('addon command', 'say', 'start', 'a' .. string.char(b) .. 'b')
+    end
+    W.fire('addon command', 'say', 'start', 'a' .. string.char(127) .. 'b')
+    local _, count = W.saved()
+    check(count == 0, "R6 制御文字を含むセリフは保存しない (保存 " .. count .. ")")
+    W.fire('addon command', 'say', 'start', string.char(130, 160, 133, 64))
+    local _, after = W.saved()
+    check(after == 1, "R6 0x80 以上のバイトは断らない")
+end
+
 -- ファジング: 応答の欠落・遅延・重複・不一致をランダムに起こして、不変条件を確かめる
 if FUZZ then
     math.randomseed(777)
@@ -482,7 +731,7 @@ if FUZZ then
         W.run_until(200, function(t)
             if not stopped_at then
                 -- 終了判定: run が nil になった (チャットに 中止/完了 が出た)
-                if W.log_has('中止しました') or W.log_has('完了しました') or W.log_has('マジックバースト成功') or W.log_has('MB なし') or W.log_has('MB になりませんでした') then
+                if W.log_has('中止しました') or W.log_has('マジックバースト成功') or W.log_has('MB なし') or W.log_has('MB になりませんでした') then
                     stopped_at = t; n_at_stop = #W.sent
                 end
             end
